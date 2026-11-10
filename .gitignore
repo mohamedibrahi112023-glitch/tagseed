@@ -1,0 +1,29 @@
+# مفاتيح وإعدادات سرية — ما تترفعش أبدًا
+.env
+*.env
+!.env.example
+
+# قواعد البيانات (فيها حسابات المستخدمين ومحادثاتهم وملفاتهم)
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# بيئات وحزم بتتسطب من جديد
+backend/.venv/
+venv/
+__pycache__/
+*.pyc
+node_modules/
+frontend/dist/
+
+# إعدادات أدوات محلية على جهازك
+.claude/
+
+# ملفات العرض والمستندات الكبيرة
+*.pptx
+
+# نظام التشغيل والمحررات
+.DS_Store
+Thumbs.db
+*.log

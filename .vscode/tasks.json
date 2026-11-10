@@ -1,0 +1,56 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Backend",
+      "type": "process",
+      "command": "${workspaceFolder}\\backend\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "uvicorn", "main:app", "--app-dir", "backend", "--reload", "--reload-dir", "backend", "--port", "8000"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "isBackground": true,
+      // أي سطر يطبعه السيرفر يكفي إن VS Code يكمّل؛ "Wait for servers" هي اللي بتتأكد إنه جاهز فعلًا
+      "problemMatcher": {
+        "owner": "tagseed",
+        "pattern": { "regexp": "^__never_matches__$" },
+        "background": { "activesBegin": true, "beginsPattern": ".", "endsPattern": "." }
+      },
+      "presentation": { "panel": "dedicated", "group": "tagseed" }
+    },
+    {
+      "label": "Frontend",
+      // npm.cmd مباشرة من غير PowerShell، لأن سياسة التشغيل في ويندوز بتمنع npm.ps1
+      "type": "process",
+      "command": "npm.cmd",
+      "args": ["run", "dev", "--", "--strictPort"],
+      "options": { "cwd": "${workspaceFolder}\\frontend" },
+      "isBackground": true,
+      "problemMatcher": {
+        "owner": "tagseed",
+        "pattern": { "regexp": "^__never_matches__$" },
+        "background": { "activesBegin": true, "beginsPattern": ".", "endsPattern": "." }
+      },
+      "presentation": { "panel": "dedicated", "group": "tagseed" }
+    },
+    {
+      "label": "Wait for servers",
+      "type": "process",
+      "command": "powershell.exe",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}\\.vscode\\wait-for-servers.ps1"],
+      "problemMatcher": [],
+      "presentation": { "reveal": "silent", "panel": "shared" }
+    },
+    {
+      "label": "Run Tagseed",
+      "dependsOn": ["Backend", "Frontend"],
+      "dependsOrder": "parallel",
+      "problemMatcher": [],
+      "group": { "kind": "build", "isDefault": true }
+    },
+    {
+      "label": "Start Tagseed",
+      "dependsOn": ["Run Tagseed", "Wait for servers"],
+      "dependsOrder": "sequence",
+      "problemMatcher": []
+    }
+  ]
+}
