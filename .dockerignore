@@ -1,0 +1,11 @@
+.git
+.env
+**/.env
+*.db
+**/node_modules
+**/.venv
+**/__pycache__
+frontend/dist
+.claude
+.vscode
+*.pptx

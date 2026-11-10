@@ -8,11 +8,13 @@ load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from router import pick_tier
 from workspaces import WORKSPACES
 DB_PATH = os.getenv("DB_PATH", "tagseed_v2.db")
+os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
 OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY", "")
 ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "1500"))
@@ -33,9 +35,13 @@ JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret-change-me")
 DAILY_REQUESTS = int(os.getenv("DAILY_REQUESTS", "20"))  # 0 = بدون حد
 SIGNUPS_PER_IP_DAY = int(os.getenv("SIGNUPS_PER_IP_DAY", "5"))
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+# على السيرفر الحقيقي (ENV=production) ممنوع نشتغل بمفتاح الجلسات الافتراضي: أي حد كان هيقدر يزوّر جلسة
+if os.getenv("ENV") == "production" and JWT_SECRET == "dev-secret-change-me":
+    raise RuntimeError("JWT_SECRET لازم يتغيّر قبل النشر")
+CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",") if o.strip()]
 
 app = FastAPI(title="Tagseed API")
-app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173"],
+app.add_middleware(CORSMiddleware, allow_origins=CORS_ORIGINS,
                    allow_methods=["*"], allow_headers=["*"])
 bearer = HTTPBearer(auto_error=False)
 
@@ -812,3 +818,11 @@ def attachment(aid: str, u=Depends(current_user)):
     return Response(a["data"], media_type=a["mime"] if safe else "text/plain; charset=utf-8",
                     headers={"Content-Disposition": f"inline; filename*=UTF-8''{quote(a['name'])}",
                              "X-Content-Type-Options": "nosniff", "Cache-Control": "private, max-age=3600"})
+
+
+# ---------- الواجهة بعد البناء ----------
+# في النشر الخادم بيقدّم الواجهة كمان (رابط واحد للموقع). محليًا Vite هو اللي بيقدّمها، والفولدر ده مش موجود.
+# لازم يفضل آخر حاجة في الملف علشان مسارات /api تتطابق الأول.
+FRONTEND_DIST = os.getenv("FRONTEND_DIST", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "frontend", "dist"))
+if os.path.isdir(FRONTEND_DIST):
+    app.mount("/", StaticFiles(directory=FRONTEND_DIST, html=True), name="frontend")
