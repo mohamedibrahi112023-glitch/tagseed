@@ -1,0 +1,8 @@
+# مكتبات دالة Vercel (api/index.py). لازم تطابق backend/requirements.txt
+fastapi==0.162.2
+httpx==0.28.1
+python-dotenv==1.2.4
+bcrypt==5.0.0
+PyJWT==2.15.1
+psycopg[binary]==3.3.8
+psycopg-pool==3.3.3

@@ -61,6 +61,17 @@ cd frontend; npm.cmd run dev
 
 للتأكد إن الخادم متظبط: افتح `http://localhost:8000/api/health` وشوف `"configured": true`.
 
+## النشر أونلاين (Vercel)
+
+الواجهة بتتبني كملفات ثابتة، والـ API بيشتغل كدالة Python (`api/index.py`)، والبيانات في Postgres لأن ملفات Vercel مش بتفضل.
+
+1. [vercel.com/new](https://vercel.com/new) ← سجّل بـ GitHub ← اختار مستودع `tagseed` ← **Deploy** (أول نشر هيفشل لحد ما تضيف الخطوات اللي بعد كده، وده طبيعي).
+2. في المشروع: **Storage** ← **Create Database** ← **Neon (Postgres)** ← الخطة المجانية ← **Connect**. ده بيضيف `DATABASE_URL` لوحده.
+3. **Settings** ← **Environment Variables**: ضيف `GEMINI_API_KEY` و`JWT_SECRET` (نص عشوائي طويل)، و`POLLINATIONS_TOKEN` لو عندك.
+4. **Deployments** ← آخر نشر ← **Redeploy**.
+
+على Vercel: المرفقات لحد 3 ميجا للرسالة، والتسجيل الصوتي لحد حوالي 90 ثانية، علشان حد Vercel لحجم الطلب (4.5 ميجا).
+
 ## النشر أونلاين (Render)
 
 المستودع فيه `Dockerfile` بيبني الواجهة ويشغّل الخادم، والخادم بيقدّم الموقع والـ API على رابط واحد، و`render.yaml` بيجهّز الخدمة.

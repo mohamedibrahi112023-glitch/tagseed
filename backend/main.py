@@ -1,4 +1,5 @@
 import asyncio, base64, os, re, sqlite3, time, uuid
+from contextlib import contextmanager
 from urllib.parse import quote
 import bcrypt, httpx, jwt
 from dotenv import load_dotenv
@@ -30,13 +31,20 @@ POLLINATIONS_TOKEN = os.getenv("POLLINATIONS_TOKEN", "")  # اختياري: بي
 TTS_MODELS = os.getenv("TTS_MODELS", "gemini-3.8-flash-lite-tts,gemini-3.1-flash-tts-preview")
 TTS_VOICE = os.getenv("TTS_VOICE", "Kore")
 DAILY_TTS = int(os.getenv("DAILY_TTS", "60"))  # 0 = بدون حد
-MODELS = {t: os.getenv(f"MODEL_{t.upper()}", "") for t in ("fast", "balanced", "strong")}
+# لو في مفتاح Gemini ومفيش أسماء نماذج، نستخدم نماذج شغالة على الخطة المجانية
+DEFAULT_MODELS = {"fast": "gemini-3.5-flash-lite", "balanced": "gemini-3-flash-preview", "strong": "gemini-3-flash-preview"}
+MODELS = {t: os.getenv(f"MODEL_{t.upper()}", "") or (DEFAULT_MODELS[t] if GEMINI_KEY else "") for t in DEFAULT_MODELS}
+ON_VERCEL = bool(os.getenv("VERCEL"))
+# Vercel بيرفض أي طلب أو رد أكبر من 4.5 ميجا، فالحدود هناك أصغر
+MAX_FILE_MB = float(os.getenv("MAX_FILE_MB", "3" if ON_VERCEL else "10"))
+MAX_TOTAL_MB = float(os.getenv("MAX_TOTAL_MB", "3" if ON_VERCEL else "15"))
+TTS_MAX_CHARS = int(os.getenv("TTS_MAX_CHARS", "900" if ON_VERCEL else "2500"))
 JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret-change-me")
 DAILY_REQUESTS = int(os.getenv("DAILY_REQUESTS", "20"))  # 0 = بدون حد
 SIGNUPS_PER_IP_DAY = int(os.getenv("SIGNUPS_PER_IP_DAY", "5"))
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 # على السيرفر الحقيقي (ENV=production) ممنوع نشتغل بمفتاح الجلسات الافتراضي: أي حد كان هيقدر يزوّر جلسة
-if os.getenv("ENV") == "production" and JWT_SECRET == "dev-secret-change-me":
+if (os.getenv("ENV") == "production" or ON_VERCEL) and JWT_SECRET == "dev-secret-change-me":
     raise RuntimeError("JWT_SECRET لازم يتغيّر قبل النشر")
 CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",") if o.strip()]
 
@@ -46,50 +54,106 @@ app.add_middleware(CORSMiddleware, allow_origins=CORS_ORIGINS,
 bearer = HTTPBearer(auto_error=False)
 
 
-def db():
-    c = sqlite3.connect(DB_PATH)
-    c.row_factory = sqlite3.Row
-    return c
+# ---------- قاعدة البيانات ----------
+# محليًا: ملف SQLite. على الاستضافة (Vercel): Postgres من DATABASE_URL، لأن ملفات السيرفر هناك مش بتفضل.
+# الاستعلامات مكتوبة مرة واحدة بعلامة ? وبتتحوّل لـ %s في Postgres.
+DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL") or ""
+PG = DATABASE_URL.startswith(("postgres://", "postgresql://"))
+if ON_VERCEL and not PG:
+    raise RuntimeError("على Vercel لازم قاعدة بيانات Postgres: Storage ← Neon، وبعدها DATABASE_URL بيتضاف لوحده")
 
 
-with db() as c:
-    c.executescript("""
-    CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT UNIQUE NOT NULL,
-        password_hash TEXT NOT NULL, trials_used INTEGER NOT NULL DEFAULT 0, subscribed INTEGER NOT NULL DEFAULT 0, created REAL);
-    CREATE TABLE IF NOT EXISTS signups(ip TEXT, created REAL);
-    CREATE TABLE IF NOT EXISTS conversations(id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, workspace TEXT NOT NULL,
-        title TEXT, created REAL);
-    CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id TEXT NOT NULL,
-        role TEXT, content TEXT, model TEXT, created REAL);
-    CREATE TABLE IF NOT EXISTS attachments(id TEXT PRIMARY KEY, message_id INTEGER NOT NULL, name TEXT NOT NULL,
-        mime TEXT NOT NULL, size INTEGER NOT NULL, data BLOB NOT NULL);
-    CREATE INDEX IF NOT EXISTS attachments_message ON attachments(message_id);
-    """)
-    cols = {r[1] for r in c.execute("PRAGMA table_info(users)")}
-    if "usage_day" not in cols:
-        c.execute("ALTER TABLE users ADD COLUMN usage_day TEXT")
-    if "usage_count" not in cols:
-        c.execute("ALTER TABLE users ADD COLUMN usage_count INTEGER NOT NULL DEFAULT 0")
-    if "img_day" not in cols:
-        c.execute("ALTER TABLE users ADD COLUMN img_day TEXT")
-    if "img_count" not in cols:
-        c.execute("ALTER TABLE users ADD COLUMN img_count INTEGER NOT NULL DEFAULT 0")
-    if "tts_day" not in cols:
-        c.execute("ALTER TABLE users ADD COLUMN tts_day TEXT")
-    if "tts_count" not in cols:
-        c.execute("ALTER TABLE users ADD COLUMN tts_count INTEGER NOT NULL DEFAULT 0")
-    if "display_name" not in cols:
-        c.execute("ALTER TABLE users ADD COLUMN display_name TEXT NOT NULL DEFAULT ''")
-    if "home_ws" not in cols:
-        c.execute("ALTER TABLE users ADD COLUMN home_ws TEXT NOT NULL DEFAULT ''")
-    if "token_ver" not in cols:  # بيزيد مع تغيير كلمة المرور فيلغي الجلسات القديمة
-        c.execute("ALTER TABLE users ADD COLUMN token_ver INTEGER NOT NULL DEFAULT 0")
-    if "role" not in cols:
-        c.execute("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT ''")
-    if "country" not in cols:
-        c.execute("ALTER TABLE users ADD COLUMN country TEXT NOT NULL DEFAULT ''")
-    if "terms_at" not in cols:
-        c.execute("ALTER TABLE users ADD COLUMN terms_at REAL")
+class Row(dict):
+    """صف بيتقري بالاسم أو بالرقم، زي sqlite3.Row."""
+    def __getitem__(self, k):
+        return list(self.values())[k] if isinstance(k, int) else super().__getitem__(k)
+
+
+if PG:
+    from psycopg_pool import ConnectionPool
+
+    _pool = ConnectionPool(DATABASE_URL, min_size=0, max_size=4, open=True)
+
+    def _pg_rows(cursor):
+        names = [d.name for d in cursor.description or []]
+        return lambda values: Row(zip(names, values))
+
+    class _PgConn:
+        def __init__(self, conn):
+            self.conn = conn
+
+        def execute(self, sql: str, args=()):
+            cur = self.conn.cursor(row_factory=_pg_rows)
+            cur.execute(sql.replace("?", "%s"), tuple(args) if args else None)
+            return cur
+
+    @contextmanager
+    def db():
+        with _pool.connection() as conn:  # commit لو كله تمام، rollback لو حصل خطأ
+            yield _PgConn(conn)
+else:
+    @contextmanager
+    def db():
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+
+USER_COLUMNS = {  # أعمدة اتضافت بعد أول نسخة، علشان قواعد البيانات القديمة تتحدّث لوحدها
+    "usage_day": "TEXT", "usage_count": "INTEGER NOT NULL DEFAULT 0", "img_day": "TEXT",
+    "img_count": "INTEGER NOT NULL DEFAULT 0", "tts_day": "TEXT", "tts_count": "INTEGER NOT NULL DEFAULT 0",
+    "display_name": "TEXT NOT NULL DEFAULT ''", "home_ws": "TEXT NOT NULL DEFAULT ''",
+    "token_ver": "INTEGER NOT NULL DEFAULT 0",  # بيزيد مع تغيير كلمة المرور فيلغي الجلسات القديمة
+    "role": "TEXT NOT NULL DEFAULT ''", "country": "TEXT NOT NULL DEFAULT ''", "terms_at": "DOUBLE PRECISION",
+}
+
+
+def init_db():
+    serial, num, blob = ("BIGSERIAL", "BIGINT", "BYTEA") if PG else ("INTEGER", "INTEGER", "BLOB")
+    auto = "" if PG else " AUTOINCREMENT"
+    with db() as c:
+        for stmt in [
+            f"""CREATE TABLE IF NOT EXISTS users(id {serial} PRIMARY KEY{auto}, email TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL, trials_used INTEGER NOT NULL DEFAULT 0,
+                subscribed INTEGER NOT NULL DEFAULT 0, created DOUBLE PRECISION)""",
+            "CREATE TABLE IF NOT EXISTS signups(ip TEXT, created DOUBLE PRECISION)",
+            f"""CREATE TABLE IF NOT EXISTS conversations(id TEXT PRIMARY KEY, user_id {num} NOT NULL,
+                workspace TEXT NOT NULL, title TEXT, created DOUBLE PRECISION)""",
+            f"""CREATE TABLE IF NOT EXISTS messages(id {serial} PRIMARY KEY{auto}, conversation_id TEXT NOT NULL,
+                role TEXT, content TEXT, model TEXT, created DOUBLE PRECISION)""",
+            f"""CREATE TABLE IF NOT EXISTS attachments(id TEXT PRIMARY KEY, message_id {num} NOT NULL, name TEXT NOT NULL,
+                mime TEXT NOT NULL, size INTEGER NOT NULL, data {blob} NOT NULL)""",
+            "CREATE INDEX IF NOT EXISTS attachments_message ON attachments(message_id)",
+            "CREATE INDEX IF NOT EXISTS messages_conversation ON messages(conversation_id)",
+            "CREATE INDEX IF NOT EXISTS conversations_user ON conversations(user_id, workspace)",
+        ]:
+            c.execute(stmt)
+        extra = {"users": USER_COLUMNS, "attachments": {"created": "DOUBLE PRECISION"}}
+        for table, columns in extra.items():
+            if PG:
+                for col, typ in columns.items():
+                    c.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {typ}")
+            else:
+                have = {r[1] for r in c.execute(f"PRAGMA table_info({table})")}
+                for col, typ in columns.items():
+                    if col not in have:
+                        c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
+
+
+init_db()
+
+
+def client_ip(request: Request) -> str:
+    """IP المستخدم الحقيقي ورا بروكسي الاستضافة (Vercel / Render)."""
+    forwarded = request.headers.get("x-real-ip") or request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+    return forwarded or (request.client.host if request.client else "unknown")
 
 
 # ---------- auth ----------
@@ -166,7 +230,7 @@ def register(body: RegisterIn, request: Request):
     if not body.accept_terms:
         raise HTTPException(400, "لازم توافق على شروط الاستخدام")
     role, country = clean_profile(body.role, body.country)
-    ip = request.client.host if request.client else "unknown"
+    ip = client_ip(request)
     now = time.time()
     with db() as c:
         n = c.execute("SELECT COUNT(*) FROM signups WHERE ip=? AND created>?", (ip, now - 86400)).fetchone()[0]
@@ -175,9 +239,9 @@ def register(body: RegisterIn, request: Request):
         if c.execute("SELECT 1 FROM users WHERE email=?", (email,)).fetchone():
             raise HTTPException(409, "البريد ده مسجّل بالفعل")
         h = bcrypt.hashpw(body.password.encode(), bcrypt.gensalt()).decode()
-        uid = c.execute("INSERT INTO users(email,password_hash,created,display_name,role,country,terms_at) VALUES(?,?,?,?,?,?,?)",
-                        (email, h, now, name, role, country, now)).lastrowid
-        c.execute("INSERT INTO signups VALUES(?,?)", (ip, now))
+        uid = c.execute("INSERT INTO users(email,password_hash,created,display_name,role,country,terms_at) "
+                        "VALUES(?,?,?,?,?,?,?) RETURNING id", (email, h, now, name, role, country, now)).fetchone()[0]
+        c.execute("INSERT INTO signups(ip,created) VALUES(?,?)", (ip, now))
     return {"token": make_token(uid, 0)}
 
 
@@ -302,7 +366,7 @@ def refund_quota(uid: int, kind: str = "chat"):
 
 
 # ---------- المرفقات ----------
-MAX_FILES, MAX_FILE_MB, MAX_TOTAL_MB = 5, 10, 15
+MAX_FILES = 5  # MAX_FILE_MB و MAX_TOTAL_MB في أول الملف (أصغر على Vercel)
 TEXT_EXT = {".txt", ".md", ".csv", ".json", ".xml", ".html", ".css", ".js", ".jsx", ".ts", ".tsx", ".py", ".java",
             ".c", ".cpp", ".h", ".cs", ".go", ".rs", ".php", ".rb", ".sql", ".yaml", ".yml", ".log", ".ini", ".sh"}
 IMAGE_MIMES = {"image/png", "image/jpeg", "image/webp", "image/gif", "image/heic", "image/heif"}
@@ -342,17 +406,20 @@ def decode_attachments(items: list[AttachmentIn]) -> list[dict]:
         except ValueError:
             raise HTTPException(400, f"الملف «{a.name}» تالف")
         if len(raw) > MAX_FILE_MB * 1024 * 1024:
-            raise HTTPException(400, f"الملف «{a.name}» أكبر من {MAX_FILE_MB} ميجا")
+            raise HTTPException(400, f"الملف «{a.name}» أكبر من {MAX_FILE_MB:g} ميجا")
         total += len(raw)
         mime = a.mime or ("application/pdf" if kind == "pdf" else "text/plain")
         out.append({"name": a.name, "mime": mime, "kind": kind, "data": raw})
     if total > MAX_TOTAL_MB * 1024 * 1024:
-        raise HTTPException(400, f"مجموع المرفقات أكبر من {MAX_TOTAL_MB} ميجا")
+        raise HTTPException(400, f"مجموع المرفقات أكبر من {MAX_TOTAL_MB:g} ميجا")
     return out
 
 
 def as_text(att: dict) -> str:
     return f"[ملف مرفق: {att['name']}]\n{att['data'].decode('utf-8', errors='replace')[:100_000]}"
+
+
+ATT_INSERT = "INSERT INTO attachments(id,message_id,name,mime,size,data,created) VALUES(?,?,?,?,?,?,?)"
 
 
 def delete_attachments_of(c, where: str, args: tuple):
@@ -520,8 +587,11 @@ async def call_llm(provider: str, model: str, system: str, history: list[dict]) 
 @app.get("/api/health")
 def health():
     tiers = {t: bool(provider_for(m)) for t, m in MODELS.items()}
+    # 16kHz أحادي = 32 كيلوبايت في الثانية، و90% من الحد علشان يفضل مكان للنص
+    record_sec = int(min(300, MAX_TOTAL_MB * 1024 * 1024 / 32000 * 0.9))
     return {"configured": all(tiers.values()), "tiers": tiers,
-            "images": bool(GEMINI_KEY and GEMINI_IMAGE_MODELS.strip()) or "pollinations" in IMAGE_PROVIDERS}
+            "images": bool(GEMINI_KEY and GEMINI_IMAGE_MODELS.strip()) or "pollinations" in IMAGE_PROVIDERS,
+            "limits": {"files": MAX_FILES, "file_mb": MAX_FILE_MB, "total_mb": MAX_TOTAL_MB, "record_sec": record_sec}}
 
 
 @app.post("/api/chat")
@@ -555,12 +625,13 @@ async def chat(body: ChatIn, u=Depends(current_user)):
         with db() as c:
             if not cid:
                 cid, new_conv = uuid.uuid4().hex, True
-                c.execute("INSERT INTO conversations VALUES(?,?,?,?,?)", (cid, uid, body.workspace, title, time.time()))
-            msg_id = c.execute("INSERT INTO messages(conversation_id,role,content,created) VALUES(?,?,?,?)",
-                               (cid, "user", text, time.time())).lastrowid
+                c.execute("INSERT INTO conversations(id,user_id,workspace,title,created) VALUES(?,?,?,?,?)",
+                          (cid, uid, body.workspace, title, time.time()))
+            msg_id = c.execute("INSERT INTO messages(conversation_id,role,content,created) VALUES(?,?,?,?) RETURNING id",
+                               (cid, "user", text, time.time())).fetchone()[0]
             for a in atts:
                 aid = uuid.uuid4().hex
-                c.execute("INSERT INTO attachments VALUES(?,?,?,?,?,?)", (aid, msg_id, a["name"], a["mime"], len(a["data"]), a["data"]))
+                c.execute(ATT_INSERT, (aid, msg_id, a["name"], a["mime"], len(a["data"]), a["data"], time.time()))
                 saved.append({"id": aid, "name": a["name"], "mime": a["mime"], "size": len(a["data"])})
             rows = c.execute("SELECT id,role,content FROM messages WHERE conversation_id=? ORDER BY id", (cid,)).fetchall()[-20:]
             hist = [dict(role=r["role"], content=r["content"], id=r["id"]) for r in rows]
@@ -611,13 +682,13 @@ async def chat(body: ChatIn, u=Depends(current_user)):
                 note = "خدمة الصور عليها ضغط دلوقتي، ابعت نفس الطلب تاني بعد دقيقة."
     reply_atts = []
     with db() as c:
-        rid = c.execute("INSERT INTO messages(conversation_id,role,content,model,created) VALUES(?,?,?,?,?)",
-                        (cid, "assistant", reply, model, time.time())).lastrowid
+        rid = c.execute("INSERT INTO messages(conversation_id,role,content,model,created) VALUES(?,?,?,?,?) RETURNING id",
+                        (cid, "assistant", reply, model, time.time())).fetchone()[0]
         if image:
             mime, raw = image
             aid = uuid.uuid4().hex
             name = f"tagseed-{time.strftime('%Y%m%d-%H%M%S')}.{'png' if mime == 'image/png' else 'jpg'}"
-            c.execute("INSERT INTO attachments VALUES(?,?,?,?,?,?)", (aid, rid, name, mime, len(raw), raw))
+            c.execute(ATT_INSERT, (aid, rid, name, mime, len(raw), raw, time.time()))
             reply_atts.append({"id": aid, "name": name, "mime": mime, "size": len(raw)})
         fresh = c.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
     if note:
@@ -636,7 +707,7 @@ def speech_text(text: str) -> str:
     t = re.sub(r"```[\s\S]*?```", " (في الرد كود، تقدر تشوفه مكتوب) ", text)
     t = re.sub(r"https?://\S+", " ", t)
     t = re.sub(r"[*_#>`|~]+", " ", t)
-    return re.sub(r"\s+", " ", t).strip()[:2500]
+    return re.sub(r"\s+", " ", t).strip()[:TTS_MAX_CHARS]
 
 
 def pcm_to_wav(pcm: bytes, rate: int) -> bytes:
@@ -801,7 +872,7 @@ def messages(cid: str, u=Depends(current_user)):
                 m["content"] = strip_image_tags(m["content"])
         by_id = {m["id"]: m for m in msgs}
         for a in c.execute("SELECT a.id,a.message_id,a.name,a.mime,a.size FROM attachments a JOIN messages m ON m.id=a.message_id "
-                           "WHERE m.conversation_id=? ORDER BY a.rowid", (cid,)):
+                           "WHERE m.conversation_id=? ORDER BY a.created, a.id", (cid,)):
             by_id[a["message_id"]].setdefault("attachments", []).append(
                 {"id": a["id"], "name": a["name"], "mime": a["mime"], "size": a["size"]})
         return msgs

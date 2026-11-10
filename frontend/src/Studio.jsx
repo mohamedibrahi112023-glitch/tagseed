@@ -68,8 +68,9 @@ export default function Studio() {
     const c = cv.current;
     setSending(true);
     c.discardActiveObject(); c.requestRenderAll();
-    const blob = await (await fetch(c.toDataURL({ format: "png", multiplier: 2 }))).blob();
-    const att = await prepareFile(new File([blob], `tagseed-edit-${Date.now()}.png`, { type: "image/png" }));
+    // JPEG علشان الحجم يفضل صغير (الاستضافة بترفض الطلبات الكبيرة)
+    const blob = await (await fetch(c.toDataURL({ format: "jpeg", quality: 0.9, multiplier: 2 }))).blob();
+    const att = await prepareFile(new File([blob], `tagseed-edit-${Date.now()}.jpg`, { type: "image/jpeg" }));
     sendToChat(from.returnTo, from.cid, att);
   };
 

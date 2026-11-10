@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { api } from "./api.js";
 import {
-  ACCEPT, MAX_FILES, attachmentUrl, canSpeak, fmtSize, kindOf, prepareFile,
+  ACCEPT, LIMITS, attachmentUrl, canSpeak, fmtSize, kindOf, loadLimits, prepareFile,
   recordingToAttachment, speak, startRecording, stopSpeaking,
 } from "./media.js";
 import { sendToStudio, takeForChat } from "./handoff.js";
@@ -9,7 +9,6 @@ import { sendToStudio, takeForChat } from "./handoff.js";
 const TIER_LABEL = { fast: "سريع", balanced: "متوازن", strong: "قوي" };
 const SIDE_KEY = "tagseed_side_open";
 const VOICE_KEY = "tagseed_voice_replies";
-const MAX_RECORD_SEC = 300;
 const isNarrow = () => window.matchMedia("(max-width: 700px)").matches;
 const readFlag = (k, dflt) => { try { const v = localStorage.getItem(k); return v === null ? dflt : v === "1"; } catch { return dflt; } };
 const saveFlag = (k, v) => { try { localStorage.setItem(k, v ? "1" : "0"); } catch {} };
@@ -71,7 +70,7 @@ export default function Chat({ ws, title, categories, me, refreshMe }) {
   const loadConvs = () => api(`/conversations?workspace=${ws}`).then(setConvs).catch(() => {});
   useEffect(() => { setCid(null); setMsgs([]); loadConvs(); }, [ws]);
   useEffect(() => { endRef.current?.scrollIntoView({ behavior: "smooth" }); }, [msgs, busy]);
-  useEffect(() => () => { stopSpeaking(); }, []);
+  useEffect(() => { loadLimits(); return () => { stopSpeaking(); }; }, []);
   // راجع من المحرر بصورة متعدّلة: نرجع لنفس المحادثة والصورة تتحط كمرفق جاهز للإرسال
   useEffect(() => {
     const back = takeForChat(window.location.hash);
@@ -85,7 +84,7 @@ export default function Chat({ ws, title, categories, me, refreshMe }) {
     const t = setInterval(() => {
       const s = (Date.now() - rec.start) / 1000;
       setRecSec(s);
-      if (s >= MAX_RECORD_SEC) finishRecording();
+      if (s >= LIMITS.record_sec) finishRecording();
     }, 250);
     return () => clearInterval(t);
   }, [rec]);
@@ -99,9 +98,14 @@ export default function Chat({ ws, title, categories, me, refreshMe }) {
   const addFiles = async (files) => {
     setError("");
     const list = [...files];
-    if (pending.length + list.length > MAX_FILES) { setError(`أقصى عدد مرفقات في الرسالة ${MAX_FILES}`); return; }
+    if (pending.length + list.length > LIMITS.files) { setError(`أقصى عدد مرفقات في الرسالة ${LIMITS.files}`); return; }
+    let total = pending.reduce((s, a) => s + a.size, 0);
     for (const f of list) {
-      try { const a = await prepareFile(f); setPending((p) => [...p, a]); } catch (e) { setError(e.message); }
+      try {
+        const a = await prepareFile(f);
+        if (total + a.size > LIMITS.total_mb * 1024 * 1024) { setError(`مجموع المرفقات لازم يكون أقل من ${LIMITS.total_mb} ميجا`); return; }
+        total += a.size; setPending((p) => [...p, a]);
+      } catch (e) { setError(e.message); }
     }
   };
   const removePending = (key) => setPending((p) => p.filter((a) => a.key !== key));
@@ -252,7 +256,7 @@ export default function Chat({ ws, title, categories, me, refreshMe }) {
             <div className="composer recording" role="status">
               <span className="rec-dot" aria-hidden="true" />
               <span className="rec-time">جاري التسجيل {clock(recSec)}</span>
-              <span className="rec-limit">الحد {clock(MAX_RECORD_SEC)}</span>
+              <span className="rec-limit">الحد {clock(LIMITS.record_sec)}</span>
               <button type="button" className="ghost-btn" onClick={cancelRecording}>إلغاء</button>
               <button type="button" onClick={finishRecording}>إرسال الصوت</button>
             </div>

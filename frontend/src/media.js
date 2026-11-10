@@ -1,8 +1,10 @@
 import { getToken } from "./api.js";
 
-// لازم تطابق حدود المرفقات في backend/main.py
-export const MAX_FILES = 5;
-export const MAX_FILE_MB = 10;
+// حدود المرفقات والتسجيل بتيجي من السيرفر (/api/health) لأنها أصغر على Vercel. دي القيم لحد ما توصل.
+export const LIMITS = { files: 5, file_mb: 10, total_mb: 15, record_sec: 300 };
+let limitsLoaded = null;
+export const loadLimits = () => (limitsLoaded ??= fetch("/api/health").then((r) => r.json())
+  .then((h) => { if (h.limits) Object.assign(LIMITS, h.limits); }).catch(() => { limitsLoaded = null; }));
 export const ACCEPT = "image/*,application/pdf,audio/*,.txt,.md,.csv,.json,.xml,.html,.css,.js,.jsx,.ts,.tsx,.py,.java,.c,.cpp,.h,.cs,.go,.rs,.php,.rb,.sql,.yaml,.yml,.log,.ini,.sh";
 
 const TEXT_EXT = /\.(txt|md|csv|json|xml|html|css|jsx?|tsx?|py|java|c|cpp|h|cs|go|rs|php|rb|sql|ya?ml|log|ini|sh)$/i;
@@ -55,7 +57,7 @@ export async function prepareFile(file) {
   if (kind === "audio" && !AUDIO_OK.has(mime)) {
     ({ blob } = await toWav(file)); mime = "audio/wav"; name = name.replace(/\.[^.]+$/, "") + ".wav";
   }
-  if (blob.size > MAX_FILE_MB * 1024 * 1024) throw new Error(`الملف «${name}» أكبر من ${MAX_FILE_MB} ميجا`);
+  if (blob.size > LIMITS.file_mb * 1024 * 1024) throw new Error(`الملف «${name}» أكبر من ${LIMITS.file_mb} ميجا`);
   return { key: crypto.randomUUID(), name, mime, kind, size: blob.size, url: URL.createObjectURL(blob), data: await toBase64(blob) };
 }
 
